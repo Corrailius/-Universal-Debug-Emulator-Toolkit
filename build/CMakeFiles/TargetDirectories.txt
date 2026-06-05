@@ -1,0 +1,3 @@
+C:/Users/Admin Louka/Documents/Personel/-Universal-Debug-Emulator-Toolkit/build/CMakeFiles/udet.dir
+C:/Users/Admin Louka/Documents/Personel/-Universal-Debug-Emulator-Toolkit/build/CMakeFiles/edit_cache.dir
+C:/Users/Admin Louka/Documents/Personel/-Universal-Debug-Emulator-Toolkit/build/CMakeFiles/rebuild_cache.dir
