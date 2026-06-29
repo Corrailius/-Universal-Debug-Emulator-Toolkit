@@ -3,20 +3,245 @@ name: CI
 on:
   push:
     branches: ['**']
+    tags: ['v*.*.*']
   pull_request:
     branches: ['**']
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
-    runs-on: windows-latest
+  format:
+    name: clang-format
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install clang-format
+        run: sudo apt-get install -y clang-format
+
+      - name: Check formatting
+        run: |
+          find src -name '*.cpp' -o -name '*.h' \
+            | xargs clang-format --dry-run --Werror
+
+  build-and-test:
+    name: Build & test (${{ matrix.os }})
+    needs: format
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        include:
+          - os: windows-latest
+            cmake_preset: windows
+            artifact_name: udet-windows
+            binary: build/Release/udet.exe
+          - os: ubuntu-latest
+            cmake_preset: linux
+            artifact_name: udet-linux
+            binary: build/udet
+          - os: macos-latest
+            cmake_preset: macos
+            artifact_name: udet-macos
+            binary: build/udet
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.7.*'
+          cache: true
+
+      - name: Cache CMake build
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: cmake-${{ matrix.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: cmake-${{ matrix.os }}-
+
       - name: Configure CMake
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          -DUDET_BUILD_TESTS=ON
 
       - name: Build
-        run: cmake --build build --config Release
+        run: cmake --build build --config Release --parallel
 
-      - name: Run tests
+      - name: Run unit tests
+        run: ctest --test-dir build --config Release --output-on-failure
+
+      - name: Check binary size
+        shell: bash
+        run: |
+          SIZE=$(wc -c < "${{ matrix.binary }}")
+          echo "Binary size: $SIZE bytes"
+          MAX=$((50 * 1024 * 1024))   # 50 MB limit
+          if [ "$SIZE" -gt "$MAX" ]; then
+            echo "ERROR: binary exceeds $MAX bytes" && exit 1
+          fi
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.binary }}
+          retention-days: 7
+
+  sanitize:
+    name: Sanitizers (Linux)
+    needs: format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.7.*'
+          cache: true
+
+      - name: Configure CMake (Debug + sanitizers)
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DUDET_BUILD_TESTS=ON
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run tests under sanitizers
+        # ASAN_OPTIONS=halt_on_error ensures the process exits
+        # non-zero on the first sanitizer violation so CI fails
+        # clearly rather than continuing with corrupt state.
+        env:
+          ASAN_OPTIONS: halt_on_error=1:detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build --output-on-failure
+
+  static-analysis:
+    name: clang-tidy
+    needs: format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-tidy
+        run: sudo apt-get install -y clang-tidy
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.7.*'
+          cache: true
+
+      - name: Configure CMake (export compile commands)
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Run clang-tidy
+        run: |
+          find src -name '*.cpp' \
+            | xargs clang-tidy -p build --warnings-as-errors='*'
+
+  smoke-test:
+    name: Smoke test (${{ matrix.os }})
+    needs: build-and-test
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: udet-windows
+            binary: udet.exe
+          - os: ubuntu-latest
+            artifact: udet-linux
+            binary: udet
+          - os: macos-latest
+            artifact: udet-macos
+            binary: udet
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+
+      - name: Make executable (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: chmod +x ${{ matrix.binary }}
+
+      - name: Smoke test — version
+        run: ./${{ matrix.binary }} --version
+
+      - name: Smoke test — help
+        run: ./${{ matrix.binary }} --help
+
+  plugin-verify:
+    name: Plugin ABI check (${{ matrix.os }})
+    needs: build-and-test
+    if: false  # remove this line once plugins produce .so/.dll/.dylib
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: udet-windows
+            plugin_glob: 'build/plugins/*.dll'
+          - os: ubuntu-latest
+            artifact: udet-linux
+            plugin_glob: 'build/plugins/*.so'
+          - os: macos-latest
+            artifact: udet-macos
+            plugin_glob: 'build/plugins/*.dylib'
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+
+      - name: Verify plugin IIDs
+        shell: bash
+        run: |
+          for plugin in ${{ matrix.plugin_glob }}; do
+            echo "Verifying $plugin"
+            ./udet --verify-plugin "$plugin"
+          done
+
+  release:
+    name: Create release
+    needs: [build-and-test, smoke-test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create a GitHub Release
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release (draft)
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            artifacts/udet-windows/udet.exe
+            artifacts/udet-linux/udet
+            artifacts/udet-macos/udet
