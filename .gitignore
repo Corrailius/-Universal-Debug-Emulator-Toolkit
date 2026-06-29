@@ -1,2 +1,8 @@
 UDET_Development_plan.md
 SKELETON.md
+
+build/
+*.exe
+*.pdb
+*.ilk
+*.obj
