@@ -19,9 +19,9 @@ add_executable(udet
 )
 
 target_include_directories(udet PRIVATE
-    src
-)
-
-target_include_directories(udet PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug)
+endif()
